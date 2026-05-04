@@ -62,6 +62,16 @@ const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   child.on('error', reject);
 });
 
+const capture = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
+  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  child.on('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr.trim() || `${cmd} exited with ${code}`)));
+  child.on('error', reject);
+});
+
 const cmdLogin = async () => {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
@@ -102,6 +112,24 @@ const cmdWorkspaces = async () => {
     const name = w.name ?? '(sin nombre)';
     const type = w.type ?? '?';
     log(`${id}\t${type}\t${name}`);
+  }
+};
+
+const cmdStatus = async (dir) => {
+  const cfg = await readConfig();
+  log(`API: ${cfg.apiUrl || '(sin login)'}`);
+  log(`Usuario: ${cfg.email || cfg.uid || '(sin login)'}`);
+
+  const target = path.resolve(dir || '.');
+  log(`Directorio: ${target}`);
+  try {
+    const workspaceId = (await capture('git', ['-C', target, 'config', '--get', 'agora.workspaceId'])).trim();
+    const apiUrl = (await capture('git', ['-C', target, 'config', '--get', 'agora.apiUrl']).catch(() => '')).trim();
+    log(`Workspace: ${workspaceId || '(no configurado)'}`);
+    if (apiUrl) log(`Workspace API: ${apiUrl}`);
+    await run('git', ['-C', target, 'status', '--short', '--branch']);
+  } catch {
+    log('Workspace: (este directorio no parece un workspace Agora inicializado)');
   }
 };
 
@@ -213,6 +241,7 @@ const help = () => {
 Uso:
   agora login                       Login con Firebase ID token.
   agora logout                      Borra credenciales locales.
+  agora status [dir]                Muestra login y estado git del workspace.
   agora workspaces                  Lista tus workspaces.
   agora clone <wsId> [dir]          Clona el repo del workspace.
   agora init <dir>                  Convierte un dir existente en workspace.
@@ -229,6 +258,7 @@ const main = async () => {
   switch (cmd) {
     case 'login': return cmdLogin();
     case 'logout': return cmdLogout();
+    case 'status': return cmdStatus(args[0]);
     case 'workspaces': case 'ls': return cmdWorkspaces();
     case 'clone': return cmdClone(args[0], args[1]);
     case 'init': return cmdInit(args[0]);

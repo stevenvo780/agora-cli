@@ -11,7 +11,7 @@ NAS via Git interno (Forgejo); el editor web de Agora ve esos cambios al próxim
 npm i -g @agora/cli
 
 # o desde el repo
-cd services/agora-cli
+cd AgoraCli
 npm link
 ```
 
@@ -25,6 +25,14 @@ agora pull [dir]                  # actualiza desde el NAS
 agora push [dir] -m "mensaje"     # sube cambios al NAS
 agora watch [dir]                 # sync automático cada 30s
 ```
+
+## Alcance mínimo estable
+
+- `auth`: `login`, `logout`, lectura segura de `~/.agora/config.json`.
+- `status`: inspección local sin imprimir tokens.
+- `clone`: provisiona/lee repo Forgejo y configura `git config agora.workspaceId`.
+- `sync`: `pull`, `push`, `watch` sobre Git.
+- `open editor`: no abre un editor específico todavía; el flujo soportado es clonar/init y abrir el directorio con tu IDE preferido.
 
 ## Cómo funciona
 
