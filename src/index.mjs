@@ -75,8 +75,9 @@ const capture = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
 const cmdLogin = async () => {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const apiUrlIn = await rl.question('URL del API de Agora (ej: https://agora.humanizar-dev.cloud): ');
-    const apiUrl = apiUrlIn.trim().replace(/\/$/, '');
+    const DEFAULT_API_URL = process.env.AGORA_API_URL || 'https://agora.elenxos.com';
+    const apiUrlIn = await rl.question(`URL del API de Agora [${DEFAULT_API_URL}]: `);
+    const apiUrl = (apiUrlIn.trim() || DEFAULT_API_URL).replace(/\/$/, '');
     if (!apiUrl) errExit('apiUrl requerida');
 
     log(`\nAbre en tu navegador: ${apiUrl}/login?cli=1`);
@@ -221,14 +222,12 @@ const cmdWatch = async (dir) => {
   const tick = async () => {
     try { await run('git', ['-C', target, 'pull', '--rebase', '--autostash', '--quiet']); } catch { /* noop */ }
     try {
-      const c = spawn('git', ['-C', target, 'diff', '--quiet']);
-      c.on('exit', async (code) => {
-        if (code !== 0) {
-          await run('git', ['-C', target, 'add', '-A']);
-          await run('git', ['-C', target, 'commit', '-m', `agora-watch ${new Date().toISOString()}`]).catch(() => undefined);
-          await run('git', ['-C', target, 'push']).catch(() => undefined);
-        }
-      });
+      const porcelain = await capture('git', ['-C', target, 'status', '--porcelain']);
+      if (porcelain.trim()) {
+        await run('git', ['-C', target, 'add', '-u']);
+        await run('git', ['-C', target, 'commit', '-m', `agora-watch ${new Date().toISOString()}`]).catch(() => undefined);
+        await run('git', ['-C', target, 'push']).catch(() => undefined);
+      }
     } catch { /* noop */ }
   };
   setInterval(tick, 30_000);
