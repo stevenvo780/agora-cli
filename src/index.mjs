@@ -3,7 +3,10 @@
  * agora — CLI para trabajar workspaces de Agora fuera del editor web.
  *
  * Comandos:
- *   agora login                  Guarda tu Firebase ID token + base URL en ~/.agora/config.json.
+ *   agora login [--token PAT]    Guarda credenciales en ~/.agora/config.json.
+ *                                  Sin --token: flujo interactivo (Firebase ID token, temporal).
+ *                                  Con --token agora_pat_...: usa un PAT permanente generado en
+ *                                  Agora Settings → Acceso CLI.
  *   agora workspaces             Lista tus workspaces.
  *   agora clone <wsId> [dir]     Clona el repo Forgejo del workspace en `dir` (default: ./<wsId>).
  *   agora pull [dir]             git pull --rebase del workspace.
@@ -20,6 +23,7 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline/promises';
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 
 const CONFIG_DIR = path.join(os.homedir(), '.agora');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -56,6 +60,49 @@ const apiCall = async (cfg, path, init = {}) => {
   return body;
 };
 
+// ── Worker mode ──────────────────────────────────────────────────────────────
+// Dentro de un edu-worker, el CLI autentica como la MÁQUINA (HMAC con
+// WORKER_TOKEN+WORKER_SECRET que el container ya tiene en el env), no como un
+// usuario. Así funciona sin un PAT humano — que en un workspace COMPARTIDO sería
+// un hueco de seguridad. Reusa el endpoint sync worker-list que ya valida HMAC.
+const WORKER_TOKEN = process.env.WORKER_TOKEN || '';
+const WORKER_SECRET = (process.env.WORKER_SYNC_SECRET || process.env.WORKER_SECRET || '').trim();
+const isWorkerMode = () => Boolean(WORKER_TOKEN && WORKER_SECRET);
+const workerAuthHeaders = () => {
+  const ts = Date.now();
+  let uid = null;
+  if (WORKER_TOKEN.startsWith('personal:')) uid = WORKER_TOKEN.slice('personal:'.length);
+  const sig = createHmac('sha256', WORKER_SECRET)
+    .update(`${WORKER_TOKEN}:${ts}${uid ? `:${uid}` : ''}`).digest('hex');
+  const h = { 'X-Worker-Token': WORKER_TOKEN, 'X-Worker-Ts': String(ts), 'X-Worker-Sig': sig };
+  if (uid) h['X-Worker-Uid'] = uid;
+  return h;
+};
+const workerApiBase = async () => {
+  const env = (process.env.AGORA_BACKEND_URL || process.env.NEXUS_URL || '').replace(/\/$/, '');
+  if (env) return env;
+  const cfg = await readConfig();
+  return (cfg.apiUrl || '').replace(/\/$/, '');
+};
+const workerListFiles = async () => {
+  const base = await workerApiBase();
+  if (!base) throw new Error('sin apiUrl (AGORA_BACKEND_URL no seteado)');
+  const items = [];
+  let cursor = null;
+  do {
+    const url = new URL(`${base}/api/sync/worker-list`);
+    url.searchParams.set('workspaceId', WORKER_TOKEN);
+    url.searchParams.set('presign', 'false');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const res = await fetch(url.toString(), { headers: { ...workerAuthHeaders(), Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text().catch(() => '')).slice(0, 140)}`);
+    const data = await res.json();
+    for (const i of (data.items || [])) items.push(i);
+    cursor = (typeof data.nextCursor === 'string' && data.nextCursor) ? data.nextCursor : null;
+  } while (cursor);
+  return items;
+};
+
 const run = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   const child = spawn(cmd, args, { stdio: 'inherit', ...opts });
   child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited with ${code}`)));
@@ -72,21 +119,54 @@ const capture = (cmd, args, opts = {}) => new Promise((resolve, reject) => {
   child.on('error', reject);
 });
 
-const cmdLogin = async () => {
+const PAT_PREFIX = 'agora_pat_';
+
+const cmdLogin = async (args) => {
+  const DEFAULT_API_URL = process.env.AGORA_API_URL || 'https://agora.elenxos.com';
+
+  // --token flag: login con PAT sin flujo interactivo
+  const tokenFlagIdx = args.indexOf('--token');
+  if (tokenFlagIdx !== -1) {
+    const patValue = args[tokenFlagIdx + 1];
+    if (!patValue || !patValue.startsWith(PAT_PREFIX)) {
+      errExit(`El valor de --token debe comenzar con "${PAT_PREFIX}". Generá uno en Agora Settings → Acceso CLI.`);
+    }
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    let apiUrl;
+    try {
+      const apiUrlIn = await rl.question(`URL del API de Agora [${DEFAULT_API_URL}]: `);
+      apiUrl = (apiUrlIn.trim() || DEFAULT_API_URL).replace(/\/$/, '');
+    } finally { rl.close(); }
+
+    if (!apiUrl) errExit('apiUrl requerida');
+    const cfg = { apiUrl, token: patValue, savedAt: new Date().toISOString() };
+    try {
+      const me = await apiCall(cfg, '/api/users/me');
+      cfg.uid = me?.uid ?? me?.id ?? null;
+      cfg.email = me?.email ?? null;
+    } catch (e) {
+      errExit(`Login falló: ${e.message}`);
+    }
+    await writeConfig(cfg);
+    log(`✅ Login OK — ${cfg.email ?? cfg.uid ?? 'autenticado'}\nConfig guardada en ${CONFIG_PATH}`);
+    return;
+  }
+
+  // Flujo interactivo (Firebase ID token — expira en 1h)
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const DEFAULT_API_URL = process.env.AGORA_API_URL || 'https://agora.elenxos.com';
     const apiUrlIn = await rl.question(`URL del API de Agora [${DEFAULT_API_URL}]: `);
     const apiUrl = (apiUrlIn.trim() || DEFAULT_API_URL).replace(/\/$/, '');
     if (!apiUrl) errExit('apiUrl requerida');
 
-    log(`\nAbre en tu navegador: ${apiUrl}/login?cli=1`);
-    log('Pega aquí el ID token de Firebase (DevTools → Application → IndexedDB → firebase-installations o copia desde el perfil):');
+    log(`\nPara autenticación permanente: generá un PAT en Agora Settings → Acceso CLI`);
+    log(`y usá: agora login --token agora_pat_...\n`);
+    log('O pegá aquí un Firebase ID token (expira en 1h):');
     const token = (await rl.question('ID token: ')).trim();
     if (!token) errExit('token requerido');
 
     const cfg = { apiUrl, token, savedAt: new Date().toISOString() };
-    // Test
     try {
       const me = await apiCall(cfg, '/api/users/me');
       cfg.uid = me?.uid ?? me?.id ?? null;
@@ -105,6 +185,14 @@ const cmdLogout = async () => {
 };
 
 const cmdWorkspaces = async () => {
+  // En worker mode `ls` lista los archivos del workspace de la máquina (vía
+  // worker-list/HMAC), no los workspaces del usuario (no hay usuario).
+  if (isWorkerMode()) {
+    const files = await workerListFiles();
+    for (const f of files) log(`${f.repoPath}\t${f.size ?? '?'}B`);
+    if (files.length === 0) log('(workspace vacío)');
+    return;
+  }
   const cfg = await readConfig();
   const ws = await apiCall(cfg, '/api/workspaces');
   if (!Array.isArray(ws)) { console.log(JSON.stringify(ws, null, 2)); return; }
@@ -118,6 +206,19 @@ const cmdWorkspaces = async () => {
 
 const cmdStatus = async (dir) => {
   const cfg = await readConfig();
+  if (isWorkerMode()) {
+    const base = await workerApiBase();
+    log(`Modo: worker (autenticación de máquina vía HMAC)`);
+    log(`Workspace: ${WORKER_TOKEN}`);
+    log(`API: ${base || '(sin apiUrl)'}`);
+    try {
+      const files = await workerListFiles();
+      log(`✅ Conectado — ${files.length} archivos en el workspace`);
+    } catch (e) {
+      log(`⚠ Conexión: ${e.message}`);
+    }
+    return;
+  }
   log(`API: ${cfg.apiUrl || '(sin login)'}`);
   log(`Usuario: ${cfg.email || cfg.uid || '(sin login)'}`);
 
@@ -238,8 +339,10 @@ const help = () => {
   console.log(`agora — CLI Agora workspaces
 
 Uso:
-  agora login                       Login con Firebase ID token.
-  agora logout                      Borra credenciales locales.
+  agora login [--token agora_pat_...]   Login. Con --token usa un PAT permanente
+                                        (generalo en Agora Settings → Acceso CLI).
+                                        Sin --token: flujo interactivo (expira 1h).
+  agora logout                          Borra credenciales locales.
   agora status [dir]                Muestra login y estado git del workspace.
   agora workspaces                  Lista tus workspaces.
   agora clone <wsId> [dir]          Clona el repo del workspace.
@@ -255,7 +358,7 @@ Config: ${CONFIG_PATH}
 const main = async () => {
   const [, , cmd, ...args] = process.argv;
   switch (cmd) {
-    case 'login': return cmdLogin();
+    case 'login': return cmdLogin(args);
     case 'logout': return cmdLogout();
     case 'status': return cmdStatus(args[0]);
     case 'workspaces': case 'ls': return cmdWorkspaces();
