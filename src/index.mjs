@@ -312,8 +312,11 @@ const cmdPush = async (dir, args) => {
     c.on('error', reject);
     c.on('exit', (code) => resolve(code !== 0));
   });
-  if (!hasChanges) { log('No hay cambios.'); return; }
-  await run('git', ['-C', target, 'commit', '-m', msg]);
+  if (hasChanges) {
+    await run('git', ['-C', target, 'commit', '-m', msg]);
+  } else {
+    log('No hay cambios para commitear.');
+  }
   await run('git', ['-C', target, 'push']);
 };
 
